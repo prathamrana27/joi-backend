@@ -1,0 +1,14 @@
+create a .env file inside the main dir and structure it like this with your api keys
+
+OPENAI_API_KEY=gxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GEMINI_API_KEY=Axxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GOOGLE_API_KEY=Axxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GOOGLE_SEARCH_ENGINE_ID=519xxxxxxxxxx
+GOOGLE_SEARCH_API_KEY=AIzxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+MONGO_URI=mongodb://127.0.0.1:27017
+MONGO_DB_NAME=joi_local
+MONGO_SESSIONS_COLLECTION=sessions
+MONGO_FEEDBACK_COLLECTION=message_feedback
+REDIS_URL=redis://127.0.0.1:6379/0
+REDIS_SESSIONS_LIST_TTL=20
+REDIS_SESSION_TTL=120
