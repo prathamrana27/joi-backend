@@ -578,6 +578,35 @@ def _sse_event(event_name: str, payload: Any) -> str:
     return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _normalize_tool_args(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(tool_args or {})
+
+    if tool_name != "search":
+        return normalized
+
+    raw_query = str(normalized.get("query", "")).strip()
+    if not raw_query:
+        return normalized
+
+    now = datetime.now()
+    current_year = str(now.year)
+    current_month_year = now.strftime("%B %Y")
+    month_pattern = (
+        r"\b(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+(?:19|20)\d{2}\b"
+    )
+
+    # Remove stale month-year/year mentions and append exactly one current month-year.
+    fresh_query = re.sub(month_pattern, "", raw_query, flags=re.IGNORECASE)
+    fresh_query = re.sub(r"\b(19|20)\d{2}\b", "", fresh_query)
+    fresh_query = re.sub(r"\s{2,}", " ", fresh_query).strip(" ,.-")
+    fresh_query = f"{fresh_query} {current_month_year}".strip()
+    fresh_query = fresh_query.replace(f"{current_year} {current_month_year}", current_month_year)
+
+    normalized["query"] = fresh_query
+    return normalized
+
+
 @app.post("/chat/stream")
 async def chat_stream(payload: SSEChatRequest):
     session_id = str(payload.conversation_id).strip()
@@ -642,13 +671,15 @@ async def chat_stream(payload: SSEChatRequest):
                     )
 
                 for idx, (tool_name, tool_args) in enumerate(tool_calls, start=1):
+                    effective_tool_args = _normalize_tool_args(tool_name, tool_args)
+
                     workflow_steps_executed += 1
                     yield _sse_event(
                         "workflow_step_started",
                         {
                             "step_index": workflow_steps_executed,
                             "tool": tool_name,
-                            "args": tool_args
+                            "args": effective_tool_args
                         }
                     )
 
@@ -657,7 +688,7 @@ async def chat_stream(payload: SSEChatRequest):
                         {"message": f"Executing tool call {idx}/{len(tool_calls)}: {tool_name}"}
                     )
 
-                    result = await tool_registry.execute(tool_name, tool_args)
+                    result = await tool_registry.execute(tool_name, effective_tool_args)
                     history.append({
                         "role": "assistant",
                         "content": f"{tool_name} result:\n{result}"
@@ -666,7 +697,7 @@ async def chat_stream(payload: SSEChatRequest):
 
                     yield _sse_event(
                         "tool_result",
-                        {"tool": tool_name, "args": tool_args, "result": result}
+                        {"tool": tool_name, "args": effective_tool_args, "result": result}
                     )
                     yield _sse_event(
                         "workflow_step_completed",

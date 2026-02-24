@@ -16,6 +16,7 @@ On a new line: `TOOL_CALL::{"tool": "tool_name", "args": {"arg_key": "value", ..
 2.  **Web Search:** Searches the web.
     *   Format: `TOOL_CALL::{"tool": "search", "args": {"query": "<search_query>"}}`
     *   (e.g., `TOOL_CALL::{"tool": "search", "args": {"query": "latest AI trends"}}`)
+    *   For "latest/current/now/today" requests, always use the current year/date context. Never use stale years.
 3.  **System Info (`sysinfo`):** Gets system information.
     *   Args: `{"param": "<parameter>"}` ('basic' or 'network', defaults to 'basic')
     *   **Note:** 'basic' includes OS, CPU, memory, disk usage, uptime, and **current date/time**.
