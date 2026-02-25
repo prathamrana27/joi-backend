@@ -1,9 +1,41 @@
 import os
 import asyncio
+import sys
+from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 
-load_dotenv()
+def _resolve_env_file() -> Path | None:
+    override_path = str(os.getenv("JOI_ENV_PATH", "")).strip()
+    candidates: list[Path] = []
+
+    if override_path:
+        candidates.append(Path(override_path).expanduser())
+
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / ".env")
+
+    try:
+        candidates.append(Path(__file__).resolve().parent / ".env")
+    except Exception:
+        pass
+
+    candidates.append(Path.cwd() / ".env")
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+_env_file_path = _resolve_env_file()
+if _env_file_path:
+    load_dotenv(dotenv_path=_env_file_path, override=False)
+else:
+    load_dotenv(override=False)
 from prompts import system_prompt
 
 from tools import tool_registry

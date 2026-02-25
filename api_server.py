@@ -3,6 +3,7 @@ import json
 import uuid
 import asyncio
 import re
+import sys
 import tempfile
 import base64
 import hashlib
@@ -40,8 +41,37 @@ from bson.errors import InvalidId
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_auth_requests
 
-# Load env
-load_dotenv()
+def _resolve_env_file() -> Optional[Path]:
+    override_path = str(os.getenv("JOI_ENV_PATH", "")).strip()
+    candidates: List[Path] = []
+
+    if override_path:
+        candidates.append(Path(override_path).expanduser())
+
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / ".env")
+
+    try:
+        candidates.append(Path(__file__).resolve().parent / ".env")
+    except Exception:
+        pass
+
+    candidates.append(Path.cwd() / ".env")
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+_env_file_path = _resolve_env_file()
+if _env_file_path:
+    load_dotenv(dotenv_path=_env_file_path, override=False)
+else:
+    load_dotenv(override=False)
 
 # Logging
 logging.basicConfig(

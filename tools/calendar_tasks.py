@@ -1,6 +1,7 @@
 # --- START OF FINAL CORRECTED FILE tools/calendar_tasks.py ---
 
 import re
+import os
 import pickle
 import asyncio
 import logging
@@ -37,6 +38,15 @@ ACTION_SCOPES = {
 }
 
 
+def _resolve_tools_dir() -> Path:
+    override = str(os.getenv("JOI_GOOGLE_TOOLS_DIR", "")).strip()
+    if override:
+        candidate = Path(override).expanduser()
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate.resolve()
+    return Path(__file__).parent.resolve()
+
+
 # --- Generalized Authentication ---
 def _get_google_service_sync(
         service_name: str,
@@ -47,7 +57,7 @@ def _get_google_service_sync(
     Synchronous function to get an authenticated Google API service.
     """
     creds = None
-    tools_dir = Path(__file__).parent.resolve()
+    tools_dir = _resolve_tools_dir()
     token_filename = f'token_{service_name}_{api_version}.pickle'
     token_path = tools_dir / token_filename
     credentials_path = tools_dir / 'credentials.json'

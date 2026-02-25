@@ -1,3 +1,4 @@
+import os
 import re
 import base64
 import pickle
@@ -22,10 +23,19 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.send',
           'https://www.googleapis.com/auth/gmail.readonly']
 
 
+def _resolve_tools_dir() -> Path:
+    override = str(os.getenv("JOI_GOOGLE_TOOLS_DIR", "")).strip()
+    if override:
+        candidate = Path(override).expanduser()
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate.resolve()
+    return Path(__file__).parent.resolve()
+
+
 def _get_gmail_service_sync():
     """Synchronous function to get authenticated Gmail API service."""
     creds = None
-    tools_dir = Path(__file__).parent.resolve()
+    tools_dir = _resolve_tools_dir()
     token_path = tools_dir / 'token.pickle'
     credentials_path = tools_dir / 'credentials.json'
 
