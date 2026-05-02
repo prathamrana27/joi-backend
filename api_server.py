@@ -751,6 +751,27 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _current_time_context_prompt() -> str:
+    now_local = datetime.now().astimezone()
+    now_utc = now_local.astimezone(timezone.utc)
+    offset_raw = now_local.strftime("%z")
+    offset_fmt = (
+        f"{offset_raw[:3]}:{offset_raw[3:]}"
+        if len(offset_raw) == 5
+        else offset_raw
+    )
+    tz_name = now_local.tzname() or "local"
+
+    return (
+        "Authoritative current time context:\n"
+        f"- Local datetime: {now_local.strftime('%Y-%m-%d %H:%M:%S')} ({tz_name}, UTC{offset_fmt})\n"
+        f"- Local date: {now_local.strftime('%Y-%m-%d')}\n"
+        f"- UTC datetime: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+        "Resolve relative terms such as today/tomorrow/yesterday/this week using the local date above. "
+        "Do not treat stale source dates as current unless the user explicitly asks for historical data."
+    )
+
+
 DANGEROUS_TOOLS = {"email_sender", "file_system", "app_control", "calendar_tasks"}
 RAG_ALLOWED_SUFFIXES = {
     ".txt", ".md", ".py", ".json", ".csv", ".log", ".html", ".htm",
@@ -2165,19 +2186,29 @@ def _normalize_tool_args(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str,
     if not raw_query:
         return normalized
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
     current_year = str(now.year)
     current_month_year = now.strftime("%B %Y")
+    current_full_date = now.strftime("%Y-%m-%d")
+    current_human_date = now.strftime("%B %d, %Y")
     month_pattern = (
         r"\b(?:january|february|march|april|may|june|july|august|"
         r"september|october|november|december)\s+(?:19|20)\d{2}\b"
     )
 
-    # Remove stale month-year/year mentions and append exactly one current month-year.
+    # Remove stale month-year/year mentions and append current date context.
     fresh_query = re.sub(month_pattern, "", raw_query, flags=re.IGNORECASE)
     fresh_query = re.sub(r"\b(19|20)\d{2}\b", "", fresh_query)
     fresh_query = re.sub(r"\s{2,}", " ", fresh_query).strip(" ,.-")
-    fresh_query = f"{fresh_query} {current_month_year}".strip()
+
+    relative_time_request = bool(
+        re.search(r"\b(today|latest|current|now|tonight|this\s+week)\b", raw_query, flags=re.IGNORECASE)
+    )
+    if relative_time_request:
+        fresh_query = f"{fresh_query} {current_human_date} {current_full_date}".strip()
+    else:
+        fresh_query = f"{fresh_query} {current_month_year}".strip()
+
     fresh_query = fresh_query.replace(f"{current_year} {current_month_year}", current_month_year)
 
     normalized["query"] = fresh_query
@@ -2195,6 +2226,7 @@ async def chat_stream(
 
     owner_id = str(current_user.get("_id"))
     history = _sanitize_history(payload.history)
+    history.append({"role": "system", "content": _current_time_context_prompt()})
     memory = _read_user_memory(owner_id)
     memory_segments = []
     if memory.get("preferences"):
@@ -2474,6 +2506,7 @@ async def handle_user_message(websocket: WebSocket, connection_id: str, message:
         await handle_chat_start(websocket, connection_id)
 
     history = active_connections[connection_id]["history"]
+    history.append({"role": "system", "content": _current_time_context_prompt()})
     history.append({"role": "user", "content": message})
 
     await process_message_with_model(websocket, connection_id)
