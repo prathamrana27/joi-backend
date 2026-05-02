@@ -78,6 +78,14 @@ if (Test-Path $envExampleSrc) {
     Copy-Item $envExampleSrc (Join-Path $distAppDir ".env.example") -Force
 }
 
+$runtimeEnvSrc = Join-Path $backendRoot ".env"
+if (Test-Path $runtimeEnvSrc) {
+    Copy-Item $runtimeEnvSrc (Join-Path $distAppDir ".env") -Force
+    Write-Host "Included local .env in backend runtime package." -ForegroundColor Yellow
+} else {
+    Write-Host "No backend .env found. Packaged app will require manual runtime setup." -ForegroundColor Yellow
+}
+
 $googleCredsSrc = Join-Path $backendRoot "tools\credentials.json"
 if (Test-Path $googleCredsSrc) {
     $toolsDistDir = Join-Path $distAppDir "tools"
@@ -92,7 +100,7 @@ $readmePath = Join-Path $distAppDir "README-BACKEND.txt"
 JOI Backend Runtime Package
 ===========================
 
-1) Create a .env file in this folder (or use .env.example as reference).
+1) If .env is missing in this folder, create it using .env.example as reference.
 2) Run joi-backend.exe to start API server on port 8000.
 3) Ensure MongoDB and Redis are running and reachable from .env settings.
 
