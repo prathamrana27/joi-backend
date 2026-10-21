@@ -53,86 +53,15 @@ def _get_google_service_sync(
         api_version: str,
         scopes: List[str]
 ) -> Tuple[Optional[Resource], Optional[str]]:
-    """
-    Synchronous function to get an authenticated Google API service.
-    """
-    creds = None
-    tools_dir = _resolve_tools_dir()
-    token_filename = f'token_{service_name}_{api_version}.pickle'
-    token_path = tools_dir / token_filename
-    credentials_path = tools_dir / 'credentials.json'
-
-    logger.debug(f"Looking for token at: {token_path}")
-    if token_path.exists():
-        try:
-            with open(token_path, 'rb') as token:
-                loaded_creds = pickle.load(token)
-                if isinstance(loaded_creds, Credentials):  # Basic check
-                    creds = loaded_creds
-                    logger.debug(f"Loaded credentials from {token_filename}")
-                    if not all(s in creds.scopes for s in scopes):
-                        logger.warning(
-                            f"Token {token_filename} missing required scopes. Need {scopes}, have {creds.scopes}. Re-authenticating.")
-                        creds = None
-                else:
-                    logger.warning(f"Invalid data in {token_filename}. Will re-authenticate.")
-                    creds = None
-        except (pickle.UnpicklingError, EOFError, FileNotFoundError, AttributeError, Exception) as e:
-            logger.warning(f"Failed to load or validate {token_filename}: {e}. Will re-authenticate.")
-            creds = None
-
-    if not creds or not creds.valid:
-        needs_reauth = True
-        if creds and creds.expired and creds.refresh_token:
-            logger.info(f"Attempting to refresh token for {service_name} scopes: {scopes}...")
-            try:
-                creds.refresh(Request())
-                logger.info(f"{service_name} token refreshed successfully.")
-                if not all(s in creds.scopes for s in scopes):
-                    logger.warning(
-                        f"Refreshed token still missing required scopes. Need {scopes}, have {creds.scopes}. Re-authenticating.")
-                    needs_reauth = True
-                else:
-                    needs_reauth = False
-            except Exception as e:
-                logger.warning(f"Failed to refresh {service_name} token: {e}. Will re-authenticate.")
-                creds = None
-
-        if needs_reauth:
-            logger.info(f"Performing OAuth flow for {service_name} with scopes: {scopes}")
-            if not credentials_path.exists():
-                logger.error(f"CRITICAL: credentials.json not found at {credentials_path}")
-                return None, "Error: credentials.json file not found. Cannot authenticate."
-            try:
-                flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), scopes)
-                creds = flow.run_local_server(port=0)
-                logger.info(
-                    f"{service_name} authentication successful with scopes: {creds.scopes if creds else 'None'}")
-            except Exception as e:
-                logger.error(f"Error during {service_name} authentication flow: {e}", exc_info=True)
-                return None, f"Error during {service_name} authentication flow: {str(e)}"
-            if creds:  # Only save if authentication was successful
-                try:
-                    with open(token_path, 'wb') as token:
-                        pickle.dump(creds, token)
-                    logger.info(f"Saved new credentials to {token_filename}")
-                except Exception as e:
-                    logger.error(f"Failed to save {token_filename}: {e}", exc_info=True)
-
-    if not creds:  # If creds are still None after all attempts
-        return None, f"Failed to obtain valid credentials for {service_name}."
-
+    """Get a Google API service via the unified auth (shared token, all scopes).
+    The per-action `scopes` argument is accepted for signature compatibility but
+    ignored — the combined-scope token already covers every action."""
     try:
-        service: Resource = build(service_name, api_version, credentials=creds, cache_discovery=False)
-        logger.info(f"{service_name} service (v{api_version}) built successfully.")
-        return service, None
-    except HttpError as e:
-        logger.error(f"HTTP error building {service_name} service: {e.resp.status} {e.content}", exc_info=True)
-        error_content = e.content.decode('utf-8', 'ignore') if e.content else str(e)
-        return None, f"Error building {service_name} service (HTTP {e.resp.status}): {error_content}"
+        from .google_auth import get_service
+        return get_service(service_name, api_version), None
     except Exception as e:
-        logger.error(f"Error building {service_name} service: {str(e)}", exc_info=True)
-        return None, f"Error building {service_name} service: {str(e)}"
+        logger.error(f"{service_name} service unavailable: {e}")
+        return None, f"Error: {e}"
 
 
 # --- Command Parsing ---
@@ -580,8 +509,10 @@ async def manage_calendar_tasks(args: Dict[str, Any]) -> str:
         if not scopes: return f"Error: Internal error - Action '{action}' has no defined scopes."
 
         logger.info(f"Requesting {service_name} service (v{api_version}) with scopes: {scopes} for action '{action}'")
-        service, auth_error = await loop.run_in_executor(
-            None, lambda: _get_google_service_sync(service_name, api_version, scopes)
+        # to_thread (unlike run_in_executor) copies contextvars, so the worker thread
+        # sees the per-user Google credentials the broker set for this request.
+        service, auth_error = await asyncio.to_thread(
+            _get_google_service_sync, service_name, api_version, scopes
         )
         if auth_error or not service: return auth_error or f"Error: Could not get Google {service_name.capitalize()} service."
 

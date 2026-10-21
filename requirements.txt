@@ -24,3 +24,7 @@ html2text==2024.2.26
 psutil==7.0.0
 PyAutoGUI==0.9.54
 pypiwin32 # For Windows registry access
+
+# Optional: free offline speech-to-text fallback (ElevenLabs -> local -> OpenAI)
+# Install to enable: pip install faster-whisper
+# faster-whisper==1.0.3

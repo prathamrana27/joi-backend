@@ -73,41 +73,33 @@ if (-not (Test-Path $distAppDir)) {
     throw "Backend dist folder was not created: $distAppDir"
 }
 
-$envExampleSrc = Join-Path $backendRoot "dotenv-example"
-if (Test-Path $envExampleSrc) {
-    Copy-Item $envExampleSrc (Join-Path $distAppDir ".env.example") -Force
+# Ship the secret-free template only. The developer's own .env and Google
+# credentials.json hold real keys and must never go into an installer: anyone
+# who downloads JOI could unpack them.
+$templateSrc = Join-Path $backendRoot "packaged.env"
+if (-not (Test-Path $templateSrc)) {
+    throw "packaged.env template not found: $templateSrc"
 }
-
-$runtimeEnvSrc = Join-Path $backendRoot ".env"
-if (Test-Path $runtimeEnvSrc) {
-    Copy-Item $runtimeEnvSrc (Join-Path $distAppDir ".env") -Force
-    Write-Host "Included local .env in backend runtime package." -ForegroundColor Yellow
-} else {
-    Write-Host "No backend .env found. Packaged app will require manual runtime setup." -ForegroundColor Yellow
-}
-
-$googleCredsSrc = Join-Path $backendRoot "tools\credentials.json"
-if (Test-Path $googleCredsSrc) {
-    $toolsDistDir = Join-Path $distAppDir "tools"
-    if (-not (Test-Path $toolsDistDir)) {
-        New-Item -ItemType Directory -Path $toolsDistDir | Out-Null
-    }
-    Copy-Item $googleCredsSrc (Join-Path $toolsDistDir "credentials.json") -Force
-}
+Copy-Item $templateSrc (Join-Path $distAppDir "env-template.txt") -Force
 
 $readmePath = Join-Path $distAppDir "README-BACKEND.txt"
 @"
 JOI Backend Runtime Package
 ===========================
 
-1) If .env is missing in this folder, create it using .env.example as reference.
-2) Run joi-backend.exe to start API server on port 8000.
-3) Ensure MongoDB and Redis are running and reachable from .env settings.
-
-Notes:
-- If Google Email/Calendar tools are used, credentials.json is expected in tools\.
-- Runtime env file can be overridden via JOI_ENV_PATH environment variable.
+The JOI desktop app starts this backend itself. On first run it copies
+env-template.txt to the user's data folder as .env and generates a
+per-install signing secret. Override the env file with JOI_ENV_PATH.
 "@ | Set-Content -Path $readmePath -Encoding UTF8
+
+# Last line of defence: refuse to finish if any secret-bearing file slipped in.
+$forbidden = Get-ChildItem -Path $distAppDir -Recurse -Force -File | Where-Object {
+    $_.Name -eq ".env" -or $_.Name -like ".env.*" -or $_.Name -eq "credentials.json" -or $_.Name -like "token*.pickle"
+}
+if ($forbidden) {
+    $names = ($forbidden | ForEach-Object { $_.FullName }) -join "`n"
+    throw "Secret files found in the backend package; refusing to continue:`n$names"
+}
 
 Write-Host ""
 Write-Host "Backend build complete." -ForegroundColor Green

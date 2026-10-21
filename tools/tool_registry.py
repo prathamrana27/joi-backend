@@ -8,6 +8,55 @@ logger = logging.getLogger(__name__)
 
 ToolHandler = Union[Callable[[Dict[str, Any]], str], Callable[[Dict[str, Any]], Awaitable[str]]]
 
+
+def _count_unescaped_quotes(text: str) -> int:
+    count, escaped = 0, False
+    for ch in text:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            count += 1
+    return count
+
+
+def _lenient_json_loads(raw: str) -> Any:
+    """Parse a tool-call JSON payload, repairing the slips small local models make:
+    trailing text after the object, an unclosed string, or missing closing braces."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    candidates = []
+    text = raw.strip()
+    if "}" in text:
+        candidates.append(text[: text.rfind("}") + 1])  # drop trailing junk
+    base = candidates[0] if candidates else text
+    if _count_unescaped_quotes(base) % 2 == 1:
+        # Unclosed string: close it just before the trailing run of braces.
+        stripped = base.rstrip("}")
+        closers = base[len(stripped):]
+        candidates.append(stripped + '"' + closers)
+    for cand in list(candidates) + [text]:
+        missing = cand.count("{") - cand.count("}")
+        if missing > 0:
+            candidates.append(cand + "}" * missing)
+
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("Unrepairable tool-call JSON", raw, 0)
+
+def _loggable_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    # Underscore-prefixed args are injected by the server (e.g. a user's `_token`)
+    # and must never reach the logs.
+    return {k: ("***" if str(k).startswith("_") else v) for k, v in (args or {}).items()}
+
+
 class ToolRegistry:
     """Registry for managing and executing tools based on JSON calls."""
 
@@ -42,7 +91,7 @@ class ToolRegistry:
             return f"Error: Unknown tool '{tool_name}'. Available tools: {', '.join(self.tools.keys())}"
 
         handler = self.tools[tool_name]
-        logger.info(f"Executing tool '{tool_name}' with args: {args}")
+        logger.info(f"Executing tool '{tool_name}' with args: {_loggable_args(args)}")
 
         try:
 
@@ -55,7 +104,7 @@ class ToolRegistry:
             return str(result) if result is not None else "Tool executed successfully, but returned no output."
 
         except Exception as e:
-            logger.error(f"Error executing tool '{tool_name}' with args {args}: {e}", exc_info=True)
+            logger.error(f"Error executing tool '{tool_name}' with args {_loggable_args(args)}: {e}", exc_info=True)
             return f"Error: An exception occurred while executing tool '{tool_name}': {type(e).__name__} - {e}"
 
     def extract_tool_calls(self, text: str) -> List[Tuple[str, Dict[str, Any]]]:
@@ -83,7 +132,7 @@ class ToolRegistry:
                      continue
 
                 try:
-                    payload = json.loads(json_str)
+                    payload = _lenient_json_loads(json_str)
                     # Validate the structure
                     if not isinstance(payload, dict):
                         logger.warning(f"Parsed payload on line {i+1} is not a dictionary: {payload}")

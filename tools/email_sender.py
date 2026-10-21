@@ -33,54 +33,13 @@ def _resolve_tools_dir() -> Path:
 
 
 def _get_gmail_service_sync():
-    """Synchronous function to get authenticated Gmail API service."""
-    creds = None
-    tools_dir = _resolve_tools_dir()
-    token_path = tools_dir / 'token.pickle'
-    credentials_path = tools_dir / 'credentials.json'
-
-    if token_path.exists():
-        try:
-            with open(token_path, 'rb') as token:
-                creds = pickle.load(token)
-        except (pickle.UnpicklingError, EOFError, FileNotFoundError) as e:
-            logger.warning(f"Failed to load token.pickle: {e}. Will re-authenticate.")
-            creds = None
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                logger.info("Gmail token refreshed.")
-            except Exception as e:
-                logger.warning(f"Failed to refresh token: {e}. Will re-authenticate.")
-                creds = None
-        else:
-            if not credentials_path.exists():
-                logger.error(f"CRITICAL: credentials.json not found at {credentials_path}")
-                return None, "Error: credentials.json file not found in tools directory. Cannot authenticate."
-
-            try:
-                flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
-                creds = flow.run_local_server(port=0)
-                logger.info("Gmail authentication successful.")
-            except Exception as e:
-                logger.error(f"Error during Gmail authentication flow: {e}", exc_info=True)
-                return None, f"Error during authentication flow: {str(e)}"
-
-        try:
-            with open(token_path, 'wb') as token:
-                pickle.dump(creds, token)
-        except Exception as e:
-            logger.error(f"Failed to save token.pickle: {e}", exc_info=True)
-
+    """Get the Gmail API service via the unified Google auth (shared token)."""
     try:
-        service = build('gmail', 'v1', credentials=creds)
-        logger.info("Gmail service built successfully.")
-        return service, None
+        from .google_auth import get_service
+        return get_service("gmail", "v1"), None
     except Exception as e:
-        logger.error(f"Error building Gmail service: {str(e)}", exc_info=True)
-        return None, f"Error building Gmail service: {str(e)}"
+        logger.error(f"Gmail service unavailable: {e}")
+        return None, f"Error: {e}"
 
 
 def parse_email_command(command: str) -> Dict[str, Any]:
@@ -160,6 +119,58 @@ def create_message_with_attachments(
     return {'raw': raw_message}
 
 
+MAX_BODY_CHARS = 4000
+# Zero-width and filler characters marketing emails use to pad previews.
+_INVISIBLE_RE = re.compile("[​-‏͏­⁠-⁤﻿ ]")
+
+
+def _html_to_text(html: str) -> str:
+    """Readable text from an HTML email: no CSS, scripts or head, tidy whitespace."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["style", "script", "head", "title", "meta", "noscript"]):
+        tag.decompose()
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        label = a.get_text(" ", strip=True)
+        # Keep real links readable, drop tracking-pixel style anchors with no text.
+        if label and href.startswith("http") and len(href) < 120:
+            a.replace_with(f"{label} ({href})")
+    text = soup.get_text("\n")
+    return _tidy_text(text)
+
+
+# A CSS rule: "selector { prop: value; … }", possibly spread over several lines.
+_CSS_BLOCK_RE = re.compile(r"[^\n{}]*\{(?=[^{}]*[\w-]+\s*:[^{}]*;)[^{}]*\}")
+_CSS_LINE_RE = re.compile(r"^\s*[}{]\s*$|^\s*@(media|font-face|import)\b")
+
+
+def _tidy_text(text: str) -> str:
+    text = _INVISIBLE_RE.sub(" ", text)
+    # Some senders' "plain text" part is full of leftover CSS. Remove rule blocks (repeat
+    # for blocks nested in @media), then stray braces and @-rule lines.
+    for _ in range(3):
+        stripped = _CSS_BLOCK_RE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines() if not _CSS_LINE_RE.search(ln)]
+    out, blank = [], 0
+    for ln in lines:
+        if not ln:
+            blank += 1
+            if blank > 1:
+                continue
+        else:
+            blank = 0
+        out.append(ln)
+    text = "\n".join(out).strip()
+    if len(text) > MAX_BODY_CHARS:
+        text = text[:MAX_BODY_CHARS].rstrip() + "\n\n[…email continues; ask to see more if needed]"
+    return text
+
+
 def _parse_message_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
     """Parse the message payload to extract the body content.
 
@@ -173,9 +184,10 @@ def _parse_message_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
     if 'body' in payload and 'data' in payload['body'] and payload['body']['data']:
         body_data = payload['body']['data']
         try:
-            decoded_data = base64.urlsafe_b64decode(body_data).decode('utf-8')
-            body_content = decoded_data
+            decoded_data = base64.urlsafe_b64decode(body_data).decode('utf-8', errors='replace')
             content_type = payload.get('mimeType', '')
+            # Single-part HTML emails used to come back as raw HTML/CSS.
+            body_content = _html_to_text(decoded_data) if 'html' in content_type else _tidy_text(decoded_data)
         except Exception as e:
             logger.warning(f"Error decoding message body: {e}")
             return "", ""
@@ -188,8 +200,8 @@ def _parse_message_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
             if part_mime == 'text/plain':
                 if 'body' in part and 'data' in part['body']:
                     try:
-                        decoded_data = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-                        return decoded_data, 'text/plain'
+                        decoded_data = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
+                        return _tidy_text(decoded_data), 'text/plain'
                     except Exception as e:
                         logger.warning(f"Error decoding plain text part: {e}")
 
@@ -199,12 +211,8 @@ def _parse_message_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
             if part_mime == 'text/html':
                 if 'body' in part and 'data' in part['body']:
                     try:
-                        decoded_data = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-                        # Convert HTML to plain text
-                        h = html2text.HTML2Text()
-                        h.ignore_links = False
-                        plain_text = h.handle(decoded_data)
-                        return plain_text, 'text/html'
+                        decoded_data = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
+                        return _html_to_text(decoded_data), 'text/html'
                     except Exception as e:
                         logger.warning(f"Error processing HTML part: {e}")
 
@@ -323,7 +331,9 @@ async def send_email(args: Dict[str, Any]) -> str:
 
     try:
         email_data = parse_email_command(command)
-        service, error = await loop.run_in_executor(None, _get_gmail_service_sync)
+        # to_thread (unlike run_in_executor) copies contextvars, so the worker thread
+        # sees the per-user Google credentials the broker set for this request.
+        service, error = await asyncio.to_thread(_get_gmail_service_sync)
         if not service:
             return error
 
@@ -344,11 +354,17 @@ async def send_email(args: Dict[str, Any]) -> str:
 
         # If no read parameters, check if we should list latest emails
         if not email_data['to']:
-            # No recipients and not reading - default to listing latest emails
+            # No recipients and not reading (e.g. "is Gmail connected?"): confirm the
+            # connection and list the latest emails. Never sends.
             limit = email_data['limit']
             logger.info(f"Listing latest {limit} emails")
+            try:
+                profile = await loop.run_in_executor(None, lambda: service.users().getProfile(userId='me').execute())
+                status = f"Gmail is connected ({profile.get('emailAddress', '')}).\n\n"
+            except Exception:
+                status = ""
             result = await loop.run_in_executor(None, lambda: _read_emails_sync(service, "", limit))
-            return result
+            return status + result
 
         # Otherwise, proceed with sending an email
         validated_attachment_paths: List[Path] = []

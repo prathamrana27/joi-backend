@@ -12,6 +12,33 @@ from .file_system import (
     create_directory,
     find_files
 )
+from .system_control import (
+    clipboard_read,
+    clipboard_write,
+    screenshot,
+    media_control,
+    set_brightness,
+    window_list,
+    window_focus,
+    window_close,
+    open_path,
+    type_text,
+    press_keys,
+    mouse_click,
+    power,
+    run_shell,
+)
+from .google_workspace import (
+    drive_search,
+    drive_read,
+    docs_create,
+    docs_read,
+    sheets_read,
+    sheets_append,
+    meet_create,
+    contacts_search,
+)
+from .slack_tool import slack_send, slack_list_channels, slack_read
 from .tool_registry import ToolRegistry
 
 tool_registry = ToolRegistry()
@@ -71,4 +98,36 @@ tool_registry.register(
     name="calendar", # Tool name the AI will use
     function=manage_calendar_tasks
 )
+
+# ---- System control tools ----
+tool_registry.register(name="clipboard_read", function=clipboard_read)
+tool_registry.register(name="clipboard_write", function=clipboard_write)
+tool_registry.register(name="screenshot", function=screenshot)
+tool_registry.register(name="media", function=media_control)
+tool_registry.register(name="brightness", function=set_brightness)
+tool_registry.register(name="window_list", function=window_list)
+tool_registry.register(name="window_focus", function=window_focus)
+tool_registry.register(name="window_close", function=window_close)
+tool_registry.register(name="open_path", function=open_path)
+tool_registry.register(name="type_text", function=type_text)
+tool_registry.register(name="press_keys", function=press_keys)
+tool_registry.register(name="mouse_click", function=mouse_click)
+tool_registry.register(name="power", function=power)
+tool_registry.register(name="shell", function=run_shell)
+
+# ---- Google Workspace tools ----
+tool_registry.register(name="drive_search", function=drive_search)
+tool_registry.register(name="drive_read", function=drive_read)
+tool_registry.register(name="docs_create", function=docs_create)
+tool_registry.register(name="docs_read", function=docs_read)
+tool_registry.register(name="sheets_read", function=sheets_read)
+tool_registry.register(name="sheets_append", function=sheets_append)
+tool_registry.register(name="meet_create", function=meet_create)
+tool_registry.register(name="contacts_search", function=contacts_search)
+
+# ---- Slack tools ----
+tool_registry.register(name="slack_send", function=slack_send)
+tool_registry.register(name="slack_channels", function=slack_list_channels)
+tool_registry.register(name="slack_read", function=slack_read)
+
 __all__ = ['tool_registry']

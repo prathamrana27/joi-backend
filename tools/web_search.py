@@ -36,7 +36,8 @@ def get_request_headers() -> Dict[str, str]:
 async def google_search(query: str, max_results: int) -> List[str]:
     """Perform a Google search and return a list of URLs"""
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
-         logger.error("Google Search API Key or Engine ID is missing.")
+         # Normal on customer installs (no shipped key): DuckDuckGo takes over.
+         logger.debug("Google Search API Key or Engine ID is missing.")
          return ["Error: Google Search API credentials are not configured."]
     try:
         url = "https://www.googleapis.com/customsearch/v1"

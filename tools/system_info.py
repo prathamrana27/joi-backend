@@ -1,5 +1,6 @@
 import platform
 import psutil
+import shutil
 import socket
 import datetime
 import time
@@ -40,16 +41,20 @@ def get_basic_info() -> str:
             if 'cdrom' in partition.opts or partition.fstype == '':
                  continue
             try:
-                usage = psutil.disk_usage(partition.mountpoint)
+                # stdlib shutil instead of psutil.disk_usage, which raises
+                # "SystemError: bad format char" on some Windows/Python builds.
+                usage = shutil.disk_usage(partition.mountpoint)
+                percent = round(usage.used / usage.total * 100, 1) if usage.total else 0
                 disk_info.append({
                     "device": partition.device,
                     "mountpoint": partition.mountpoint,
                     "total": format_bytes(usage.total),
                     "used": format_bytes(usage.used),
                     "free": format_bytes(usage.free),
-                    "percent": f"{usage.percent}%"
+                    "percent": f"{percent}%"
                 })
-            except (PermissionError, FileNotFoundError):
+            except Exception:
+                # One unreadable drive shouldn't take down the whole report.
                 continue
 
         # Top processes by CPU usage
@@ -282,11 +287,9 @@ def system_info(args: Dict[str, str]) -> str:
     Returns:
         str: Formatted system information ('basic' or 'network').
     """
-    param = args.get("param", "basic").strip().lower()
+    param = str(args.get("param") or "basic").strip().lower()
 
-    if param == "network":
+    if param in ("network", "net", "wifi", "ip"):
         return get_network_info()
-    elif param == "basic":
-         return get_basic_info()
-    else:
-         return f"Error: Invalid parameter '{args.get('param')}' for system_info. Use 'basic' or 'network'."
+    # Anything else ("memory", "cpu", "disk", …) is covered by the basic report.
+    return get_basic_info()
