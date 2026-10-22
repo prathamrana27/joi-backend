@@ -15,6 +15,11 @@ from google.auth.transport.requests import Request
 from pathlib import Path
 
 from .file_system import _resolve_and_validate_path, AI_WORKSPACE_DIR
+from .undo import undo_marker
+
+UNDO_SEND_SECONDS = 30
+# Larger messages (big attachments) skip the undo window rather than sit in the database.
+MAX_HELD_RAW_CHARS = 8_000_000
 
 logger = logging.getLogger(__name__)
 
@@ -396,12 +401,6 @@ async def send_email(args: Dict[str, Any]) -> str:
                     email_data['subject'], email_data['body'], validated_attachment_paths
                 )
             )
-            logger.info("Sending email via Gmail API...")
-            send_response = await loop.run_in_executor(
-                None,
-                lambda: service.users().messages().send(userId='me', body=message_body).execute()
-            )
-            logger.info(f"Email sent successfully. Response ID: {send_response.get('id')}")
         except Exception as e:
             logger.error(f"Error during email creation or sending: {e}", exc_info=True)
             return f"Error creating or sending email: {str(e)}"
@@ -409,11 +408,30 @@ async def send_email(args: Dict[str, Any]) -> str:
         recipient_count = len(email_data['to'])
         cc_count = len(email_data['cc'])
         attachment_count = len(validated_attachment_paths)
-        success_msg = f"Email sent successfully via {sender_email} to {recipient_count} recipient(s)"
-        if cc_count > 0: success_msg += f", {cc_count} CC recipient(s)"
-        if attachment_count > 0: success_msg += f" with {attachment_count} attachment(s) from the workspace"
-        success_msg += "."
-        return success_msg
+        success_msg = (
+            f"Email from {sender_email} to {recipient_count} recipient(s) is queued and sends in "
+            f"{UNDO_SEND_SECONDS} seconds"
+        )
+        if cc_count > 0: success_msg += f", with {cc_count} CC recipient(s)"
+        if attachment_count > 0: success_msg += f" and {attachment_count} attachment(s) from the workspace"
+        success_msg += ". The user can undo it until then."
+        label = f"Email to {', '.join(email_data['to'])[:60]}"
+        raw = message_body.get('raw', '')
+        if len(raw) > MAX_HELD_RAW_CHARS:
+            # Too big to hold for the undo window: send now, as before.
+            try:
+                sent = await asyncio.to_thread(
+                    lambda: service.users().messages().send(userId='me', body=message_body).execute()
+                )
+            except Exception as e:
+                logger.error(f"Error sending email: {e}", exc_info=True)
+                return f"Error creating or sending email: {str(e)}"
+            return success_msg.split(" is queued")[0] + f" was sent. Message ID: {sent.get('id')}."
+        # Undo window: the composed message is held by the backend and sent with
+        # messages.send (the gmail.send scope) after UNDO_SEND_SECONDS unless the user
+        # presses Undo. See api_server._run_undo_tick.
+        logger.info("Email composed and held for the undo window.")
+        return success_msg + undo_marker("email_send", label, UNDO_SEND_SECONDS, {"raw": raw})
 
     except Exception as e:
         logger.error(f"Unexpected error in send_email tool: {str(e)}", exc_info=True)

@@ -59,6 +59,14 @@ try {
         --collect-all psutil `
         --collect-all bs4 `
         --collect-all html2text `
+        --collect-all faster_whisper `
+        --collect-all ctranslate2 `
+        --collect-all av `
+        --collect-all tokenizers `
+        --collect-all onnxruntime `
+        --collect-all vosk `
+        --collect-all sounddevice `
+        --collect-all _sounddevice_data `
         --hidden-import uvicorn.logging `
         --hidden-import uvicorn.loops.auto `
         --hidden-import uvicorn.protocols.http.auto `

@@ -1,8 +1,12 @@
 import os
+import shutil
+import uuid
 from pathlib import Path
 import logging
 import winreg
 from typing import Dict, Any # Import Dict and Any
+
+from .undo import undo_marker
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -235,10 +239,22 @@ async def write_file(args: Dict[str, Any]) -> str:
 
 
     try:
+        # Keep the previous version (if any) so the user can undo the write for a while.
+        undo_payload = {"path": str(validated_path), "existed": validated_path.exists()}
+        if undo_payload["existed"]:
+            backup_dir = AI_WORKSPACE_DIR / ".joi_undo"
+            backup_dir.mkdir(exist_ok=True)
+            backup = backup_dir / f"{uuid.uuid4().hex}.bak"
+            shutil.copy2(validated_path, backup)
+            undo_payload["backup"] = str(backup)
         validated_path.write_text(content, encoding='utf-8')
         logger.info(f"Successfully wrote {len(content)} characters to file: {validated_path}")
         output_path_name = validated_path.relative_to(AI_WORKSPACE_DIR)
-        return f"Successfully wrote plain text content to workspace file '{output_path_name}'."
+        verb = "Overwrote" if undo_payload["existed"] else "Created"
+        return (
+            f"Successfully wrote plain text content to workspace file '{output_path_name}'."
+            + undo_marker("file_restore", f"{verb} {output_path_name}", 600, undo_payload)
+        )
     except PermissionError:
          logger.warning(f"Permission denied writing to file '{validated_path}'.")
          return f"Error: Permission denied trying to write to file '{relative_path_str}'."

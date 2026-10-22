@@ -25,6 +25,12 @@ psutil==7.0.0
 PyAutoGUI==0.9.54
 pypiwin32 # For Windows registry access
 
-# Optional: free offline speech-to-text fallback (ElevenLabs -> local -> OpenAI)
-# Install to enable: pip install faster-whisper
-# faster-whisper==1.0.3
+# Offline speech-to-text (no keys, no network after the first model download).
+# av is pinned to 16.x: av 17+ removed an argument faster-whisper 1.2.1 passes.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+av==16.0.1
+
+# "Hey JOI" wake word (offline, opt-in). The model downloads on first enable.
+vosk==0.3.45
+sounddevice==0.5.2

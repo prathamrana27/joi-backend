@@ -116,6 +116,10 @@ from prompts import system_prompt
 from security import redact_secrets, wrap_untrusted_tool_output
 from briefing import build_briefing
 from telegram_channel import TelegramChannel, get_me as tg_get_me
+import memory_learning
+import routine_triggers
+import wake_word
+from tools.undo import extract_undo
 import tools.google_auth as google_auth
 from tools.google_auth import COMBINED_SCOPES as GOOGLE_COMBINED_SCOPES
 
@@ -254,6 +258,8 @@ try:
     approvals_collection: Collection = mongo_db[MONGO_APPROVALS_COLLECTION]
     rag_chunks_collection: Collection = mongo_db[MONGO_RAG_CHUNKS_COLLECTION]
     integrations_collection: Collection = mongo_db["integrations"]
+    memory_suggestions_collection: Collection = mongo_db["memory_suggestions"]
+    undo_collection: Collection = mongo_db["undo_actions"]
     sessions_collection.create_index("session_id", unique=True)
     sessions_collection.create_index([("owner_user_id", 1), ("updated_at", DESCENDING)])
     sessions_collection.create_index([("updated_at", DESCENDING)])
@@ -290,6 +296,9 @@ try:
         pass
     try:
         integrations_collection.create_index([("owner_user_id", 1), ("provider", 1)], unique=True)
+        memory_suggestions_collection.create_index([("owner_user_id", 1), ("status", 1), ("created_at", -1)])
+        undo_collection.create_index([("status", 1), ("execute_at", 1)])
+        undo_collection.create_index("undo_id", unique=True)
     except Exception:
         pass
     try:
@@ -425,6 +434,9 @@ class RoutineCreateRequest(BaseModel):
     prompt: str = Field(..., min_length=3, max_length=8000)
     interval_minutes: int = Field(default=1440, ge=5, le=10080)
     enabled: bool = Field(default=True)
+    # When to run: on a schedule, or on an event (see routine_triggers.py).
+    trigger_type: str = Field(default="schedule", pattern="^(schedule|email|meeting|battery)$")
+    trigger_value: str = Field(default="", max_length=200)
 
 
 class RoutineUpdateRequest(BaseModel):
@@ -432,6 +444,8 @@ class RoutineUpdateRequest(BaseModel):
     prompt: Optional[str] = Field(default=None, min_length=3, max_length=8000)
     interval_minutes: Optional[int] = Field(default=None, ge=5, le=10080)
     enabled: Optional[bool] = None
+    trigger_type: Optional[str] = Field(default=None, pattern="^(schedule|email|meeting|battery)$")
+    trigger_value: Optional[str] = Field(default=None, max_length=200)
 
 
 class ReminderCreateRequest(BaseModel):
@@ -1213,7 +1227,8 @@ def _run_scheduler_tick() -> None:
 
     due_routines = list(
         routines_collection.find(
-            {"enabled": True, "next_run_at": {"$lte": now_iso}}
+            # Only timer routines; "" (event-triggered or disabled) must never match <= now.
+            {"enabled": True, "next_run_at": {"$ne": "", "$lte": now_iso}}
         ).limit(15)
     )
     for routine in due_routines:
@@ -1380,6 +1395,184 @@ async def _run_routine_jobs_tick() -> None:
             _write_audit_log(owner, "routine_executed", "error", {"job_id": str(jid)})
 
 
+def _register_undo(owner_id: str, spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Store an undo action for this user (from a tool's undo marker, see tools/undo.py)."""
+    try:
+        seconds = max(5, min(int(spec.get("seconds") or 30), 3600))
+        now = datetime.now(timezone.utc)
+        undo_id = f"undo_{uuid.uuid4().hex[:16]}"
+        expires = _as_iso(now + timedelta(seconds=seconds))
+        undo_collection.insert_one({
+            "undo_id": undo_id,
+            "owner_user_id": owner_id,
+            "kind": str(spec.get("kind") or ""),
+            "label": str(spec.get("label") or "Last action"),
+            "payload": spec.get("payload") or {},
+            "status": "pending",
+            "created_at": _as_iso(now),
+            "expires_at": expires,
+            # Queued emails are actually sent when the undo window closes.
+            "execute_at": expires if spec.get("kind") == "email_send" else "",
+        })
+        return {"undo_id": undo_id, "label": str(spec.get("label") or ""), "seconds": seconds, "kind": spec.get("kind")}
+    except Exception as exc:
+        logger.warning("Could not register undo: %s", exc)
+        return None
+
+
+def _gmail_service_for(owner_id: str):
+    creds = _get_google_credentials(owner_id)
+    if not creds:
+        raise RuntimeError("Google is not connected.")
+    from googleapiclient.discovery import build as gbuild
+    return gbuild("gmail", "v1", credentials=creds, cache_discovery=False), creds
+
+
+def _perform_undo(doc: Dict[str, Any]) -> str:
+    kind, payload, owner = doc.get("kind"), doc.get("payload") or {}, str(doc.get("owner_user_id"))
+    if kind == "email_send":
+        # The message is still held here (the claim in undo_action stops the send tick).
+        return "Email cancelled. It was not sent."
+    if kind == "calendar_restore":
+        creds = _get_google_credentials(owner)
+        if not creds:
+            raise RuntimeError("Google is not connected.")
+        from googleapiclient.discovery import build as gbuild
+        cal = gbuild("calendar", "v3", credentials=creds, cache_discovery=False)
+        cal.events().insert(calendarId="primary", body=payload.get("event") or {}).execute()
+        return "Event restored to your calendar."
+    if kind == "file_restore":
+        target = Path(payload.get("path") or "")
+        if payload.get("existed") and payload.get("backup") and Path(payload["backup"]).exists():
+            import shutil
+            shutil.copy2(payload["backup"], target)
+            Path(payload["backup"]).unlink(missing_ok=True)
+            return "File restored to its previous version."
+        if not payload.get("existed") and target.exists():
+            target.unlink()
+            return "New file removed."
+        raise RuntimeError("Nothing to restore.")
+    raise RuntimeError("This action can't be undone.")
+
+
+@app.post("/undo/{undo_id}")
+async def undo_action(undo_id: str, current_user: Dict[str, Any] = Depends(require_auth_user)):
+    owner_id = str(current_user.get("_id"))
+    # Claim it atomically so the email tick can't send it at the same moment.
+    doc = undo_collection.find_one_and_update(
+        {"undo_id": undo_id, "owner_user_id": owner_id, "status": "pending", "expires_at": {"$gt": _utc_now_iso()}},
+        {"$set": {"status": "undoing"}},
+    )
+    if not doc:
+        raise HTTPException(status_code=410, detail="Too late to undo this one.")
+    try:
+        message = await asyncio.to_thread(_perform_undo, doc)
+    except Exception as exc:
+        undo_collection.update_one({"_id": doc["_id"]}, {"$set": {"status": "failed", "error": str(exc)[:300]}})
+        raise HTTPException(status_code=500, detail=f"Couldn't undo: {exc}")
+    undo_collection.update_one(
+        {"_id": doc["_id"]}, {"$set": {"status": "undone", "undone_at": _utc_now_iso()}, "$unset": {"payload.raw": ""}}
+    )
+    _write_audit_log(owner_id, "undo", "ok", {"kind": doc.get("kind")})
+    return {"undone": True, "message": message}
+
+
+async def _run_undo_tick() -> None:
+    """Send queued emails whose undo window has closed; expire other undo records."""
+    now_iso = _utc_now_iso()
+    for _ in range(10):
+        doc = undo_collection.find_one_and_update(
+            {"kind": "email_send", "status": "pending", "execute_at": {"$ne": "", "$lte": now_iso}},
+            {"$set": {"status": "sending"}},
+        )
+        if not doc:
+            break
+        try:
+            gmail, _creds = await asyncio.to_thread(_gmail_service_for, str(doc.get("owner_user_id")))
+            await asyncio.to_thread(
+                lambda: gmail.users().messages().send(userId="me", body={"raw": doc["payload"].get("raw", "")}).execute()
+            )
+            undo_collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"status": "executed", "executed_at": _utc_now_iso()}, "$unset": {"payload.raw": ""}},
+            )
+        except Exception as exc:
+            logger.warning("Queued email %s failed to send: %s", doc.get("undo_id"), exc)
+            undo_collection.update_one({"_id": doc["_id"]}, {"$set": {"status": "failed", "error": str(exc)[:300]}})
+            _create_notification(
+                str(doc.get("owner_user_id")), "Email not sent",
+                f"{doc.get('label', 'An email')} couldn't be sent: {str(exc)[:160]}", category="email",
+            )
+    for doc in undo_collection.find({"kind": {"$ne": "email_send"}, "status": "pending", "expires_at": {"$lte": now_iso}}).limit(50):
+        backup = (doc.get("payload") or {}).get("backup")
+        if backup:
+            Path(backup).unlink(missing_ok=True)
+        undo_collection.update_one({"_id": doc["_id"]}, {"$set": {"status": "expired"}})
+
+
+_trigger_last_check: Dict[str, float] = {"battery": 0.0, "google": 0.0}
+
+
+def _enqueue_routine_job(routine: Dict[str, Any], context: str) -> None:
+    now_iso = _utc_now_iso()
+    owner = str(routine.get("owner_user_id") or "")
+    prompt = str(routine.get("prompt") or "")
+    jobs_collection.insert_one({
+        "owner_user_id": owner,
+        "job_type": "routine_execution",
+        "payload": {
+            "routine_id": str(routine.get("_id")),
+            "name": str(routine.get("name") or "Routine"),
+            "prompt": f"{prompt}\n\nWhat just happened: {context}",
+        },
+        "status": "pending",
+        "run_at": now_iso,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    })
+    _write_audit_log(owner, "routine_triggered", "ok", {"routine_id": str(routine.get("_id")), "context": context[:200]})
+
+
+async def _run_trigger_tick() -> None:
+    """Check event triggers: battery every minute, Gmail and Calendar every two minutes."""
+    now = time.monotonic()
+    check_battery = now - _trigger_last_check["battery"] >= 60
+    check_google = now - _trigger_last_check["google"] >= 120
+    if not (check_battery or check_google):
+        return
+    types = (["battery"] if check_battery else []) + (["email", "meeting"] if check_google else [])
+    if check_battery:
+        _trigger_last_check["battery"] = now
+    if check_google:
+        _trigger_last_check["google"] = now
+    for routine in routines_collection.find({"enabled": True, "trigger.type": {"$in": types}}).limit(50):
+        trigger = routine.get("trigger") or {}
+        state = dict(routine.get("trigger_state") or {})
+        owner = str(routine.get("owner_user_id") or "")
+        try:
+            if trigger.get("type") == "battery":
+                contexts, state = await asyncio.to_thread(routine_triggers.check_battery, trigger, state)
+            else:
+                creds = await asyncio.to_thread(_get_google_credentials, owner)
+                if not creds:
+                    continue
+                if trigger.get("type") == "email":
+                    contexts, state = await asyncio.to_thread(routine_triggers.check_email, trigger, state, creds)
+                else:
+                    contexts, state = await asyncio.to_thread(
+                        routine_triggers.check_meeting, trigger, state, creds, datetime.now(timezone.utc)
+                    )
+        except Exception as exc:
+            logger.warning("Trigger check failed for routine %s: %s", routine.get("_id"), exc)
+            continue
+        update: Dict[str, Any] = {"trigger_state": state}
+        if contexts:
+            update["last_run_at"] = _utc_now_iso()
+        routines_collection.update_one({"_id": routine["_id"]}, {"$set": update})
+        for context in contexts:
+            _enqueue_routine_job(routine, context)
+
+
 async def _background_scheduler_loop() -> None:
     while not background_scheduler_stop.is_set():
         try:
@@ -1390,6 +1583,14 @@ async def _background_scheduler_loop() -> None:
             await _run_briefing_tick()
         except Exception as exc:
             logger.warning("Briefing tick failed: %s", exc)
+        try:
+            await _run_undo_tick()
+        except Exception as exc:
+            logger.warning("Undo tick failed: %s", exc)
+        try:
+            await _run_trigger_tick()
+        except Exception as exc:
+            logger.warning("Trigger tick failed: %s", exc)
         try:
             await _run_routine_jobs_tick()
         except Exception as exc:
@@ -1810,6 +2011,70 @@ async def upsert_memory(payload: MemoryUpsertRequest, current_user: Dict[str, An
     return {"saved": True, "memory": _read_user_memory(owner_id)}
 
 
+async def _learn_from_message(owner_id: str, message: str) -> None:
+    try:
+        facts = await memory_learning.extract_facts(system_prompt, message)
+        if not facts:
+            return
+        memory = _read_user_memory(owner_id)
+        pending = [
+            str(d.get("text") or "")
+            for d in memory_suggestions_collection.find({"owner_user_id": owner_id, "status": "pending"}, {"text": 1})
+        ]
+        fresh = memory_learning.only_new(facts, memory["preferences"] + "\n" + memory["notes"], pending)
+        now = _utc_now_iso()
+        for fact in fresh:
+            memory_suggestions_collection.insert_one({
+                "suggestion_id": f"mem_{uuid.uuid4().hex[:12]}",
+                "owner_user_id": owner_id,
+                "text": fact,
+                "status": "pending",
+                "created_at": now,
+            })
+        if fresh:
+            logger.info("Memory: %d new suggestion(s) for %s", len(fresh), owner_id)
+    except Exception as exc:
+        logger.warning("Memory suggestion failed: %s", exc)
+
+
+@app.get("/memory/suggestions")
+async def list_memory_suggestions(current_user: Dict[str, Any] = Depends(require_auth_user)):
+    owner_id = str(current_user.get("_id"))
+    rows = list(
+        memory_suggestions_collection.find({"owner_user_id": owner_id, "status": "pending"}, {"_id": 0})
+        .sort("created_at", DESCENDING).limit(20)
+    )
+    return {"count": len(rows), "suggestions": rows}
+
+
+@app.post("/memory/suggestions/{suggestion_id}/{decision}")
+async def decide_memory_suggestion(
+    suggestion_id: str, decision: str, current_user: Dict[str, Any] = Depends(require_auth_user)
+):
+    owner_id = str(current_user.get("_id"))
+    if decision not in {"accept", "dismiss"}:
+        raise HTTPException(status_code=400, detail="Decision must be accept or dismiss.")
+    doc = memory_suggestions_collection.find_one(
+        {"owner_user_id": owner_id, "suggestion_id": suggestion_id, "status": "pending"}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Suggestion not found.")
+    now = _utc_now_iso()
+    if decision == "accept":
+        memory = _read_user_memory(owner_id)
+        notes = (memory["notes"].rstrip() + "\n- " + str(doc.get("text") or "")).strip()[:16000]
+        memory_collection.update_one(
+            {"owner_user_id": owner_id},
+            {"$set": {"owner_user_id": owner_id, "notes": notes, "updated_at": now}, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+    memory_suggestions_collection.update_one(
+        {"_id": doc["_id"]}, {"$set": {"status": "accepted" if decision == "accept" else "dismissed", "decided_at": now}}
+    )
+    _write_audit_log(owner_id, f"memory_suggestion_{decision}", "ok", {})
+    return {"saved": True, "memory": _read_user_memory(owner_id)}
+
+
 @app.delete("/memory")
 async def clear_memory(current_user: Dict[str, Any] = Depends(require_auth_user)):
     owner_id = str(current_user.get("_id"))
@@ -1901,18 +2166,25 @@ async def list_routines(current_user: Dict[str, Any] = Depends(require_auth_user
 @app.post("/routines")
 async def create_routine(payload: RoutineCreateRequest, current_user: Dict[str, Any] = Depends(require_auth_user)):
     owner_id = str(current_user.get("_id"))
+    error = routine_triggers.validate(payload.trigger_type, payload.trigger_value)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
     now = datetime.now(timezone.utc)
     next_run = now + timedelta(minutes=int(payload.interval_minutes))
+    on_schedule = payload.trigger_type == "schedule"
     doc = {
         "owner_user_id": owner_id,
         "name": str(payload.name).strip(),
         "prompt": str(payload.prompt).strip(),
         "interval_minutes": int(payload.interval_minutes),
         "enabled": bool(payload.enabled),
+        "trigger": {"type": payload.trigger_type, "value": payload.trigger_value.strip()},
+        "trigger_state": {},
         "created_at": _as_iso(now),
         "updated_at": _as_iso(now),
         "last_run_at": "",
-        "next_run_at": _as_iso(next_run) if payload.enabled else ""
+        # Event-triggered routines never run on the timer.
+        "next_run_at": _as_iso(next_run) if payload.enabled and on_schedule else ""
     }
     inserted = routines_collection.insert_one(doc)
     _write_audit_log(owner_id, "routine_create", "ok", {"routine_id": str(inserted.inserted_id)})
@@ -1938,12 +2210,24 @@ async def update_routine(
         update_fields["prompt"] = str(payload.prompt).strip()
     if payload.interval_minutes is not None:
         update_fields["interval_minutes"] = int(payload.interval_minutes)
+    trigger = dict(existing.get("trigger") or {"type": "schedule", "value": ""})
+    if payload.trigger_type is not None:
+        value = payload.trigger_value if payload.trigger_value is not None else ""
+        error = routine_triggers.validate(payload.trigger_type, value)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        trigger = {"type": payload.trigger_type, "value": value.strip()}
+        update_fields["trigger"] = trigger
+        update_fields["trigger_state"] = {}
+    enabled = bool(payload.enabled) if payload.enabled is not None else bool(existing.get("enabled"))
     if payload.enabled is not None:
-        update_fields["enabled"] = bool(payload.enabled)
-        if payload.enabled:
-            update_fields["next_run_at"] = _as_iso(datetime.now(timezone.utc) + timedelta(minutes=int(existing.get("interval_minutes") or 1440)))
-        else:
-            update_fields["next_run_at"] = ""
+        update_fields["enabled"] = enabled
+    if trigger.get("type", "schedule") == "schedule" and enabled:
+        interval = int(update_fields.get("interval_minutes") or existing.get("interval_minutes") or 1440)
+        if payload.enabled is not None or payload.trigger_type is not None or payload.interval_minutes is not None:
+            update_fields["next_run_at"] = _as_iso(datetime.now(timezone.utc) + timedelta(minutes=interval))
+    else:
+        update_fields["next_run_at"] = ""
 
     routines_collection.update_one({"_id": rid, "owner_user_id": owner_id}, {"$set": update_fields})
     updated = routines_collection.find_one({"_id": rid, "owner_user_id": owner_id})
@@ -2249,6 +2533,49 @@ class BriefingPrefsRequest(BaseModel):
     enabled: Optional[bool] = None
     time: Optional[str] = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     city: Optional[str] = Field(default=None, max_length=120)
+
+
+class WakeWordRequest(BaseModel):
+    enabled: bool
+
+
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _on_wake(owner_id: str) -> None:
+    # Called from the listener thread: hand the push to the server's event loop.
+    if _main_loop:
+        asyncio.run_coroutine_threadsafe(notification_hub.broadcast(owner_id, {"type": "wake"}), _main_loop)
+
+
+def _wake_state(owner_id: str) -> Dict[str, Any]:
+    mine = wake_word.listener.owner_id == str(owner_id)
+    return {
+        "enabled": bool((users_collection.find_one({"_id": owner_id}, {"wake_word": 1}) or {}).get("wake_word", {}).get("enabled")),
+        "status": wake_word.listener.status if mine else "off",
+        "error": wake_word.listener.error if mine else "",
+        "model_ready": wake_word.model_ready(),
+    }
+
+
+@app.get("/wake-word")
+async def get_wake_word(current_user: Dict[str, Any] = Depends(require_auth_user)):
+    return _wake_state(current_user["_id"])
+
+
+@app.put("/wake-word")
+async def set_wake_word(payload: WakeWordRequest, current_user: Dict[str, Any] = Depends(require_auth_user)):
+    owner_id = current_user["_id"]
+    users_collection.update_one(
+        {"_id": owner_id}, {"$set": {"wake_word": {"enabled": payload.enabled, "updated_at": _utc_now_iso()}}}
+    )
+    if payload.enabled:
+        # One microphone per machine: the person who turned it on most recently gets it.
+        users_collection.update_many({"_id": {"$ne": owner_id}, "wake_word.enabled": True}, {"$set": {"wake_word.enabled": False}})
+        wake_word.listener.start(str(owner_id), _on_wake)
+    elif wake_word.listener.owner_id == str(owner_id):
+        await asyncio.to_thread(wake_word.listener.stop)
+    return _wake_state(owner_id)
 
 
 @app.get("/briefing")
@@ -3324,6 +3651,8 @@ async def _agent_events(
                             google_auth.clear_user_credentials()
                     if str(result).lstrip().startswith("Error"):
                         failed_call_signatures.add(call_signature)
+                result, undo_spec = extract_undo(str(result))
+                undo_event = _register_undo(owner_id, undo_spec) if undo_spec else None
                 # Secrets are stripped and the payload is fenced as untrusted data
                 # so embedded instructions can't hijack the agent.
                 safe_result = redact_secrets(str(result))
@@ -3351,6 +3680,8 @@ async def _agent_events(
                         "result": safe_result
                     }
                 )
+                if undo_event:
+                    yield ("undo_available", undo_event)
 
             if approval_blocked:
                 if workflow_active:
@@ -3408,7 +3739,14 @@ async def chat_stream(
     _write_audit_log(owner_id, "chat_message", "ok", {"session_id": session_id})
     _upsert_session_history(session_id, payload.model, history, owner_id)
 
-    return _sse_response(_agent_events(owner_id, session_id, payload.model, history, payload.message))
+    async def events():
+        async for event_name, data in _agent_events(owner_id, session_id, payload.model, history, payload.message):
+            yield event_name, data
+        # After the answer is out, look for lasting facts worth suggesting (memory that learns).
+        if memory_learning.worth_checking(payload.message):
+            asyncio.create_task(_learn_from_message(owner_id, payload.message))
+
+    return _sse_response(events())
 
 
 @app.post("/chat/resume")
@@ -3543,6 +3881,14 @@ async def _startup_background_workers():
     background_scheduler_stop.clear()
     background_scheduler_task = asyncio.create_task(_background_scheduler_loop())
     logger.info("Background scheduler started.")
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+    try:
+        doc = users_collection.find_one({"wake_word.enabled": True}, {"_id": 1})
+        if doc:
+            wake_word.listener.start(str(doc["_id"]), _on_wake)
+    except Exception as exc:
+        logger.warning("Could not start the wake word: %s", exc)
     # Pre-load the local model and process the system prompt in the background, so the
     # user's first message doesn't wait for a cold start. Kept referenced so it isn't GC'd.
     global _llm_warmup_task
@@ -3561,6 +3907,7 @@ _llm_warmup_task: Optional[asyncio.Task] = None
 @app.on_event("shutdown")
 async def _shutdown_background_workers():
     global background_scheduler_task
+    wake_word.listener.stop()
     background_scheduler_stop.set()
     if background_scheduler_task:
         try:

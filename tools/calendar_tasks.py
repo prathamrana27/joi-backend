@@ -12,6 +12,8 @@ from pathlib import Path
 # Google API Libraries (Install required: pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib)
 from googleapiclient.discovery import build, Resource  # Resource is used for type hinting
 from googleapiclient.errors import HttpError
+
+from .undo import undo_marker
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -366,13 +368,20 @@ async def _update_event(service: Resource, params: Dict[str, Any]) -> str:
                      exc_info=True); return f"Error updating event {event_id}: {str(e)}"
 
 
+_RESTORABLE_EVENT_FIELDS = ("summary", "description", "location", "start", "end", "attendees", "reminders", "colorId", "visibility", "transparency")
+
+
 async def _delete_event(service: Resource, params: Dict[str, Any]) -> str:
     event_id = params.get('event_id', '')
     try:
         events_service = getattr(service, 'events')()
+        # Keep a copy so the user can undo the delete for a few minutes.
+        original = events_service.get(calendarId='primary', eventId=event_id).execute()
         request = events_service.delete(calendarId='primary', eventId=event_id)
         request.execute()
-        return f"Successfully deleted event with ID: {event_id}."
+        restore = {k: original[k] for k in _RESTORABLE_EVENT_FIELDS if k in original}
+        label = f"Deleted \"{original.get('summary', 'event')}\""[:120]
+        return f"Successfully deleted event with ID: {event_id}." + undo_marker("calendar_restore", label, 300, {"event": restore})
     except HttpError as e:
         if e.resp and e.resp.status == 404: return f"Error: Event ID '{event_id}' not found for deletion."
         return f"Error deleting event {event_id}: {e.resp.status if e.resp else 'Unknown'} - {e.content.decode('utf-8', 'ignore') if e.content else str(e)}"

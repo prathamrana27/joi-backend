@@ -16,6 +16,10 @@ import logging
 
 import httpx
 
+# The offline speech model is cached by huggingface_hub, which warns on Windows without
+# symlink rights; caching still works, so keep the logs quiet.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 logger = logging.getLogger("voice_provider")
 
 ELEVEN_API_BASE = "https://api.elevenlabs.io/v1"
