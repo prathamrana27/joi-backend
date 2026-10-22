@@ -162,6 +162,10 @@ SLACK_CLIENT_SECRET = str(os.getenv("SLACK_CLIENT_SECRET", "")).strip()
 SLACK_REDIRECT_URI = str(
     os.getenv("SLACK_REDIRECT_URI", "http://127.0.0.1:8000/integrations/slack/callback")
 ).strip()
+# Installed copies don't hold the Slack secret: they send the one-time code to JOI's
+# token-exchange function (infra/slack_exchange), which holds it. Dev keeps the secret.
+SLACK_EXCHANGE_URL = str(os.getenv("SLACK_EXCHANGE_URL", "")).strip()
+SLACK_CONFIGURED = bool(SLACK_CLIENT_ID and (SLACK_CLIENT_SECRET or SLACK_EXCHANGE_URL))
 SLACK_BOT_SCOPES = "chat:write,channels:read,channels:history,groups:read,users:read"
 
 # Google per-user OAuth for API access (Gmail/Calendar/Drive/Docs/Sheets/Contacts).
@@ -2643,7 +2647,7 @@ async def slack_status(current_user: Dict[str, Any] = Depends(require_auth_user)
     owner_id = str(current_user.get("_id"))
     doc = integrations_collection.find_one({"owner_user_id": owner_id, "provider": "slack"}) or {}
     return {
-        "configured": bool(SLACK_CLIENT_ID and SLACK_CLIENT_SECRET),
+        "configured": SLACK_CONFIGURED,
         "connected": bool(doc.get("access_token")),
         "team": str(doc.get("team_name") or ""),
     }
@@ -2651,8 +2655,8 @@ async def slack_status(current_user: Dict[str, Any] = Depends(require_auth_user)
 
 @app.get("/integrations/slack/connect")
 async def slack_connect(current_user: Dict[str, Any] = Depends(require_auth_user)):
-    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET):
-        raise HTTPException(status_code=400, detail="Slack is not configured on the server (SLACK_CLIENT_ID/SECRET).")
+    if not SLACK_CONFIGURED:
+        raise HTTPException(status_code=400, detail="Slack isn't available in this version of JOI yet.")
     owner_id = str(current_user.get("_id"))
     state = _sign_oauth_state(owner_id, "slack")
     from urllib.parse import urlencode
@@ -2702,13 +2706,16 @@ async def slack_callback(code: str = Query(default=""), state: str = Query(defau
     if not code:
         return _page("Slack connection cancelled.")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post("https://slack.com/api/oauth.v2.access", data={
-                "client_id": SLACK_CLIENT_ID,
-                "client_secret": SLACK_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": SLACK_REDIRECT_URI,
-            })
+        async with httpx.AsyncClient(timeout=20) as client:
+            if SLACK_CLIENT_SECRET:
+                resp = await client.post("https://slack.com/api/oauth.v2.access", data={
+                    "client_id": SLACK_CLIENT_ID,
+                    "client_secret": SLACK_CLIENT_SECRET,
+                    "code": code,
+                    "redirect_uri": SLACK_REDIRECT_URI,
+                })
+            else:
+                resp = await client.post(SLACK_EXCHANGE_URL, json={"code": code, "redirect_uri": SLACK_REDIRECT_URI})
         data = resp.json()
     except Exception as exc:
         logger.exception("Slack token exchange failed: %s", exc)

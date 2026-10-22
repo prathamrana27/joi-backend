@@ -96,7 +96,9 @@ Copy-Item $templateSrc $templateDst -Force
 # the sign-in itself happens in the user's browser with PKCE). Taken from the developer's
 # .env at build time so it never lands in git. Nothing else from .env is copied.
 $devEnv = Join-Path $backendRoot ".env"
-$shipKeys = @("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_ALLOWED_CLIENT_IDS")
+# Slack ships only its public client ID and the token-exchange URL; its secret stays on AWS.
+$shipKeys = @("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_ALLOWED_CLIENT_IDS",
+    "SLACK_CLIENT_ID", "SLACK_REDIRECT_URI", "SLACK_EXCHANGE_URL")
 if (Test-Path $devEnv) {
     $devValues = @{}
     foreach ($line in Get-Content $devEnv) {
