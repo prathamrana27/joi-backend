@@ -88,7 +88,31 @@ $templateSrc = Join-Path $backendRoot "packaged.env"
 if (-not (Test-Path $templateSrc)) {
     throw "packaged.env template not found: $templateSrc"
 }
-Copy-Item $templateSrc (Join-Path $distAppDir "env-template.txt") -Force
+$templateDst = Join-Path $distAppDir "env-template.txt"
+Copy-Item $templateSrc $templateDst -Force
+
+# The one exception: JOI's Google sign-in client. It is a "Desktop app" OAuth client,
+# which Google designs to ship inside installed apps (its secret is not confidential;
+# the sign-in itself happens in the user's browser with PKCE). Taken from the developer's
+# .env at build time so it never lands in git. Nothing else from .env is copied.
+$devEnv = Join-Path $backendRoot ".env"
+$shipKeys = @("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_ALLOWED_CLIENT_IDS")
+if (Test-Path $devEnv) {
+    $devValues = @{}
+    foreach ($line in Get-Content $devEnv) {
+        if ($line -match '^\s*([A-Z_]+)\s*=\s*"?([^"]*)"?\s*$' -and $shipKeys -contains $Matches[1]) {
+            $devValues[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+    $template = Get-Content $templateDst
+    $template = $template | ForEach-Object {
+        if ($_ -match '^([A-Z_]+)=\s*$' -and $devValues.ContainsKey($Matches[1])) { "$($Matches[1])=$($devValues[$Matches[1]])" } else { $_ }
+    }
+    Set-Content -Path $templateDst -Value $template -Encoding UTF8
+    if (-not $devValues["GOOGLE_OAUTH_CLIENT_ID"]) { Write-Warning "No GOOGLE_OAUTH_CLIENT_ID in .env: installed copies won't offer Google sign-in." }
+} else {
+    Write-Warning "No .env found: installed copies won't offer Google sign-in."
+}
 
 $readmePath = Join-Path $distAppDir "README-BACKEND.txt"
 @"
